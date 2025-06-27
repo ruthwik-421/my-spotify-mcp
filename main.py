@@ -219,8 +219,11 @@ async def callback(request):
     # --- NEW: Save session to database ---
     db = SessionLocal()
     try:
-        # Check if a session for this user already exists, update it, otherwise create new
-        existing_session = db.query(SpotifySession).filter(SpotifySession.token_info['refresh_token'] == token_info['refresh_token']).first()
+        # ** FIX: Use .astext to explicitly cast the JSON value to text for comparison **
+        existing_session = db.query(SpotifySession).filter(
+            SpotifySession.token_info['refresh_token'].astext == token_info['refresh_token']
+        ).first()
+
         if existing_session:
             existing_session.token_info = token_info
             session_id = existing_session.session_id # Reuse the existing session_id
