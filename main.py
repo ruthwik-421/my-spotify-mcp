@@ -1,4 +1,5 @@
 import os
+import uuid
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
@@ -8,41 +9,80 @@ from starlette.routing import Route
 from mcp.server.fastmcp import FastMCP
 import uvicorn
 
-# --- 1. INITIAL SETUP & CONFIGURATION (No changes here) ---
+# --- 1. CONFIGURATION ---
 
+# Load environment variables from .env file for local development
 load_dotenv()
+
+# Spotify App Credentials
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
-SCOPES = "user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-modify-public playlist-modify-private"
-sp_oauth = SpotifyOAuth(
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET,
-    redirect_uri=REDIRECT_URI,
-    scope=SCOPES,
-    cache_path=".spotipy_cache"
-)
-sp = None
 
-# --- 2. MCP SERVER AND TOOLS DEFINITION (No changes here) ---
+# New expanded scopes to access more user data
+SCOPES = (
+    "user-read-playback-state "
+    "user-modify-playback-state "
+    "user-read-currently-playing "
+    "playlist-read-private "
+    "playlist-read-collaborative "
+    "playlist-modify-public "
+    "playlist-modify-private "
+    "user-read-recently-played"
+)
+
+# In-memory storage for active user sessions.
+# In a real production app, you would use a database like Redis for this.
+# Format: { "session_id": token_info_dict, ... }
+ACTIVE_SESSIONS = {}
+
+
+# --- 2. AUTHENTICATION & SESSION HELPERS ---
+
+def create_spotify_oauth():
+    """Creates a SpotifyOAuth instance for the authentication flow."""
+    return SpotifyOAuth(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        redirect_uri=REDIRECT_URI,
+        scope=SCOPES,
+    )
+
+def get_sp_for_session(session_id: str):
+    """
+    Given a session_id, retrieve the token info, create an authenticated
+    Spotipy client, and return it. This is the core of our multi-user system.
+    """
+    token_info = ACTIVE_SESSIONS.get(session_id)
+    if not token_info:
+        raise Exception("Invalid or expired session_id. Please log in again via the web interface to get a new one.")
+
+    # Check if the token is expired and refresh if necessary
+    # This keeps the user's session alive for a long time.
+    if SpotifyOAuth.is_token_expired(token_info):
+        sp_oauth = create_spotify_oauth()
+        token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
+        ACTIVE_SESSIONS[session_id] = token_info  # Save the refreshed token
+
+    return spotipy.Spotify(auth=token_info["access_token"])
+
+
+# --- 3. MCP SERVER AND TOOLS DEFINITION ---
 
 mcp = FastMCP(
-    "Spotify Controller",
-    description="An MCP server to control Spotify playback and playlists."
+    "Public Spotify Controller",
+    description="A multi-user MCP server to control Spotify playback, playlists, and history."
 )
 
-def check_auth():
-    if not sp:
-        raise Exception("Not authenticated with Spotify. Please visit /login in your browser to authenticate.")
-
 @mcp.tool()
-def search_and_play(query: str) -> str:
-    """Searches for a song and plays the first result."""
-    check_auth()
+def search_and_play(session_id: str, query: str) -> str:
+    """Searches for a song and plays the first result for the given session."""
+    sp = get_sp_for_session(session_id)
     try:
         results = sp.search(q=query, type='track', limit=1)
         if not results['tracks']['items']:
             return f"No results found for '{query}'."
+        
         track = results['tracks']['items'][0]
         track_uri = track['uri']
         sp.start_playback(uris=[track_uri])
@@ -51,9 +91,9 @@ def search_and_play(query: str) -> str:
         return f"An error occurred: {e}"
 
 @mcp.tool()
-def pause_playback() -> str:
-    """Pauses the current playback."""
-    check_auth()
+def pause_playback(session_id: str) -> str:
+    """Pauses the current playback for the given session."""
+    sp = get_sp_for_session(session_id)
     try:
         sp.pause_playback()
         return "Playback paused."
@@ -61,9 +101,9 @@ def pause_playback() -> str:
         return f"An error occurred: {e}"
 
 @mcp.tool()
-def resume_playback() -> str:
-    """Resumes the current playback."""
-    check_auth()
+def resume_playback(session_id: str) -> str:
+    """Resumes the current playback for the given session."""
+    sp = get_sp_for_session(session_id)
     try:
         sp.start_playback()
         return "Playback resumed."
@@ -71,9 +111,9 @@ def resume_playback() -> str:
         return f"An error occurred: {e}"
 
 @mcp.tool()
-def next_track() -> str:
-    """Skips to the next track."""
-    check_auth()
+def next_track(session_id: str) -> str:
+    """Skips to the next track for the given session."""
+    sp = get_sp_for_session(session_id)
     try:
         sp.next_track()
         return "Skipped to the next track."
@@ -81,9 +121,9 @@ def next_track() -> str:
         return f"An error occurred: {e}"
 
 @mcp.tool()
-def get_current_song() -> str:
-    """Gets the currently playing song and artist."""
-    check_auth()
+def get_current_song(session_id: str) -> str:
+    """Gets the currently playing song and artist for the given session."""
+    sp = get_sp_for_session(session_id)
     try:
         track_info = sp.current_playback()
         if track_info and track_info['is_playing']:
@@ -94,47 +134,122 @@ def get_current_song() -> str:
     except Exception as e:
         return f"An error occurred: {e}"
 
-# --- 3. WEB SERVER & AUTHENTICATION (Updated Code) ---
+# --- NEW TOOLS ---
 
-def initialize_spotipy(access_token):
-    """Initializes the global spotipy client with the given token."""
-    global sp
-    sp = spotipy.Spotify(auth=access_token)
-
-async def homepage(request):
-    """Homepage that checks for a token and tries to initialize Spotipy."""
-    global sp
+@mcp.tool()
+def get_my_playlists(session_id: str) -> str:
+    """Retrieves all playlists for the user of the given session."""
+    sp = get_sp_for_session(session_id)
     try:
-        token_info = sp_oauth.get_cached_token()
-        if token_info:
-            initialize_spotipy(token_info['access_token'])
-            return Response("Authenticated with Spotify! You can now use the MCP tools.", media_type="text/plain")
-    except Exception:
-        pass # Ignore if no token
-    return RedirectResponse(url='/login')
+        playlists = sp.current_user_playlists()
+        if not playlists['items']:
+            return "You don't have any playlists."
+        
+        playlist_names = [p['name'] for p in playlists['items']]
+        return "Here are your playlists:\n" + "\n".join(f"- {name}" for name in playlist_names)
+    except Exception as e:
+        return f"An error occurred: {e}"
+
+@mcp.tool()
+def get_recently_played(session_id: str) -> str:
+    """Gets the last 5 recently played tracks for the user of the given session."""
+    sp = get_sp_for_session(session_id)
+    try:
+        results = sp.current_user_recently_played(limit=5)
+        if not results['items']:
+            return "You haven't played any tracks recently."
+
+        tracks = [f"{item['track']['name']} by {item['track']['artists'][0]['name']}" for item in results['items']]
+        return "Here are your recently played tracks:\n" + "\n".join(f"- {track}" for track in tracks)
+    except Exception as e:
+        return f"An error occurred: {e}"
+        
+@mcp.tool()
+def add_to_playlist(session_id: str, song_query: str, playlist_name: str) -> str:
+    """Searches for a song and adds it to one of the user's playlists."""
+    sp = get_sp_for_session(session_id)
+    try:
+        # 1. Find the song
+        results = sp.search(q=song_query, type='track', limit=1)
+        if not results['tracks']['items']:
+            return f"Could not find the song: '{song_query}'."
+        track = results['tracks']['items'][0]
+        track_uri = track['uri']
+        track_name = track['name']
+
+        # 2. Find the playlist
+        playlists = sp.current_user_playlists()
+        target_playlist = None
+        for p in playlists['items']:
+            if p['name'].lower() == playlist_name.lower():
+                target_playlist = p
+                break
+        
+        if not target_playlist:
+            return f"Could not find a playlist named '{playlist_name}'."
+
+        # 3. Add the song to the playlist
+        sp.playlist_add_items(target_playlist['id'], [track_uri])
+        return f"Successfully added '{track_name}' to your '{playlist_name}' playlist."
+    except Exception as e:
+        return f"An error occurred: {e}"
+
+# --- 4. WEB SERVER (STARLETTE) ---
 
 async def login(request):
     """Redirects the user to Spotify's authorization page."""
+    sp_oauth = create_spotify_oauth()
     auth_url = sp_oauth.get_authorize_url()
     return RedirectResponse(url=auth_url)
 
 async def callback(request):
-    """Handles the redirect from Spotify after the user grants permission."""
+    """
+    Handles the redirect from Spotify after user grants permission.
+    Generates a session_id, stores the token, and displays the id to the user.
+    """
+    sp_oauth = create_spotify_oauth()
     code = request.query_params['code']
-    token_info = sp_oauth.get_access_token(code)
-    initialize_spotipy(token_info['access_token'])
-    return Response("Successfully authenticated! You can close this tab.", media_type="text/plain")
+    token_info = sp_oauth.get_access_token(code, as_dict=True)
+    
+    # Generate a unique session ID for this user
+    session_id = str(uuid.uuid4())
+    
+    # Store the token info with the session ID
+    ACTIVE_SESSIONS[session_id] = token_info
 
-# ** CORRECTED LINE: Get the pre-configured app from FastMCP **
-# This app already includes the necessary /sse endpoint.
+    # Return a styled HTML page with the session ID for the user to copy
+    html_content = f"""
+    <html>
+        <head>
+            <title>Authentication Successful</title>
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+                .container {{ background-color: #282828; padding: 40px; border-radius: 10px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.5); max-width: 90%; }}
+                h1 {{ color: #1DB954; }}
+                p {{ font-size: 1.1em; line-height: 1.6;}}
+                code {{ background-color: #535353; padding: 10px; border-radius: 5px; font-family: monospace; user-select: all; word-break: break-all; display: inline-block; margin-top: 10px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Authentication Successful!</h1>
+                <p>Your app is connected. Please copy your unique Session ID below and provide it to your AI assistant for all future requests:</p>
+                <p><code>{session_id}</code></p>
+            </div>
+        </body>
+    </html>
+    """
+    return Response(html_content, media_type="text/html")
+
+# Get the pre-configured app from FastMCP, which includes the /sse endpoint
 app = mcp.sse_app()
 
-# ** NEW: Add our custom authentication routes to the app **
-app.add_route("/", homepage)
+# Add our custom authentication routes to the app
 app.add_route("/login", login)
+app.add_route("/", lambda req: RedirectResponse(url='/login'), methods=['GET'])
 app.add_route("/callback", callback)
 
-# This part allows us to run the server locally for testing
+
 if __name__ == "__main__":
-    print("Starting server. Please open http://localhost:8888 in your browser to authenticate with Spotify.")
+    print("Starting server. Please open http://localhost:8888/login in your browser to authenticate with Spotify.")
     uvicorn.run(app, host="0.0.0.0", port=8888)
