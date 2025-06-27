@@ -1,38 +1,53 @@
 import os
 import uuid
-import random # Import the random module
-import re # Import the regular expression module
+import random
+import re
+import json
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
-from starlette.applications import Starlette
 from starlette.responses import RedirectResponse, Response
 from starlette.routing import Route
 from mcp.server.fastmcp import FastMCP
 import uvicorn
+# --- NEW IMPORTS FOR DATABASE ---
+from sqlalchemy import create_engine, Column, String, JSON
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-# --- 1. CONFIGURATION (No changes here) ---
-
+# --- 1. CONFIGURATION ---
 load_dotenv()
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
 SCOPES = (
-    "user-read-playback-state "
-    "user-modify-playback-state "
-    "user-read-currently-playing "
-    "playlist-read-private "
-    "playlist-read-collaborative "
-    "playlist-modify-public "
-    "playlist-modify-private "
-    "user-read-recently-played"
+    "user-read-private user-read-playback-state user-modify-playback-state "
+    "user-read-currently-playing playlist-read-private playlist-read-collaborative "
+    "playlist-modify-public playlist-modify-private user-read-recently-played"
 )
-ACTIVE_SESSIONS = {}
 
+# --- NEW: DATABASE SETUP ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("No DATABASE_URL found in environment variables. Please set it.")
 
-# --- 2. AUTHENTICATION & SESSION HELPERS (No changes here) ---
+# SQLAlchemy setup
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# SQLAlchemy model for our sessions table
+class SpotifySession(Base):
+    __tablename__ = "spotify_sessions"
+    session_id = Column(String, primary_key=True, index=True)
+    token_info = Column(JSON)
+
+# Create the table if it doesn't exist
+Base.metadata.create_all(bind=engine)
+
+# --- 2. AUTHENTICATION & SESSION HELPERS ---
 
 def create_spotify_oauth():
+    """Creates a SpotifyOAuth instance for the authentication flow."""
     return SpotifyOAuth(
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
@@ -41,18 +56,30 @@ def create_spotify_oauth():
     )
 
 def get_sp_for_session(session_id: str):
-    token_info = ACTIVE_SESSIONS.get(session_id)
-    if not token_info:
-        raise Exception("Invalid or expired session_id. Please log in again via the web interface to get a new one.")
-    if SpotifyOAuth.is_token_expired(token_info):
-        sp_oauth = create_spotify_oauth()
-        token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
-        ACTIVE_SESSIONS[session_id] = token_info
-    return spotipy.Spotify(auth=token_info["access_token"])
+    """
+    Given a session_id, retrieve the token from the database, create an authenticated
+    Spotipy client, and return it.
+    """
+    db = SessionLocal()
+    try:
+        db_session = db.query(SpotifySession).filter(SpotifySession.session_id == session_id).first()
+        if not db_session:
+            raise Exception("Invalid or expired session_id. Please log in again via the web interface to get a new one.")
 
+        token_info = db_session.token_info
 
-# --- 3. MCP SERVER AND TOOLS DEFINITION (No changes here) ---
+        # Refresh token if expired and update the database
+        if SpotifyOAuth.is_token_expired(token_info):
+            sp_oauth = create_spotify_oauth()
+            token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
+            db_session.token_info = token_info
+            db.commit()
 
+        return spotipy.Spotify(auth=token_info["access_token"])
+    finally:
+        db.close()
+
+# --- 3. MCP SERVER AND TOOLS DEFINITION ---
 mcp = FastMCP(
     "Public Spotify Controller",
     description="A multi-user MCP server to control Spotify playback, playlists, and history."
@@ -152,8 +179,6 @@ def add_to_playlist(session_id: str, song_query: str, playlist_name: str) -> str
         if not results['tracks']['items']:
             return f"Could not find the song: '{song_query}'."
         track = results['tracks']['items'][0]
-        track_uri = track['uri']
-        track_name = track['name']
         playlists = sp.current_user_playlists()
         target_playlist = None
         for p in playlists['items']:
@@ -162,8 +187,8 @@ def add_to_playlist(session_id: str, song_query: str, playlist_name: str) -> str
                 break
         if not target_playlist:
             return f"Could not find a playlist named '{playlist_name}'."
-        sp.playlist_add_items(target_playlist['id'], [track_uri])
-        return f"Successfully added '{track_name}' to your '{playlist_name}' playlist."
+        sp.playlist_add_items(target_playlist['id'], [track['uri']])
+        return f"Successfully added '{track['name']}' to your '{playlist_name}' playlist."
     except Exception as e:
         return f"An error occurred: {e}"
 
@@ -177,46 +202,49 @@ async def login(request):
 
 async def callback(request):
     """
-    Handles the redirect from Spotify after user grants permission.
-    Generates a user-friendly session_id, stores the token, and displays the id.
+    Handles the redirect, generates a session_id, and stores the token in the database.
     """
     sp_oauth = create_spotify_oauth()
     code = request.query_params['code']
     token_info = sp_oauth.get_access_token(code, as_dict=True)
 
-    # --- THIS IS THE UPDATED LOGIC ---
-    # 1. Create a temporary client to get the user's name
     temp_sp = spotipy.Spotify(auth=token_info["access_token"])
     user_profile = temp_sp.current_user()
     
-    # 2. Sanitize display name (remove spaces/special chars) and get a random number
     display_name = user_profile.get('display_name', 'user')
     sanitized_name = re.sub(r'[^a-zA-Z0-9]', '-', display_name).lower()
     random_id = random.randint(100, 999)
-
-    # 3. Create the new, user-friendly session ID
     session_id = f"{sanitized_name}-{random_id}"
 
-    # 4. Store the token info with the new session ID
-    ACTIVE_SESSIONS[session_id] = token_info
+    # --- NEW: Save session to database ---
+    db = SessionLocal()
+    try:
+        # Check if a session for this user already exists, update it, otherwise create new
+        existing_session = db.query(SpotifySession).filter(SpotifySession.token_info['refresh_token'] == token_info['refresh_token']).first()
+        if existing_session:
+            existing_session.token_info = token_info
+            session_id = existing_session.session_id # Reuse the existing session_id
+        else:
+            new_session = SpotifySession(session_id=session_id, token_info=token_info)
+            db.add(new_session)
+        db.commit()
+    finally:
+        db.close()
 
-    # 5. Return the styled HTML page with the new session ID for the user to copy
     html_content = f"""
     <html>
-        <head>
-            <title>Authentication Successful</title>
+        <head><title>Authentication Successful</title>
             <style>
                 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
                 .container {{ background-color: #282828; padding: 40px; border-radius: 10px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.5); max-width: 90%; }}
-                h1 {{ color: #1DB954; }}
-                p {{ font-size: 1.1em; line-height: 1.6;}}
+                h1 {{ color: #1DB954; }} p {{ font-size: 1.1em; line-height: 1.6;}}
                 code {{ background-color: #535353; padding: 15px; border-radius: 5px; font-family: monospace; user-select: all; word-break: break-all; display: inline-block; margin-top: 10px; font-size: 1.2em; }}
             </style>
         </head>
         <body>
             <div class="container">
                 <h1>Authentication Successful!</h1>
-                <p>Your app is connected. Please copy your unique Session ID below and provide it to your AI assistant for all future requests:</p>
+                <p>Your session is now saved permanently. Copy your Session ID below and provide it to your AI assistant. You can now close this tab.</p>
                 <p><code>{session_id}</code></p>
             </div>
         </body>
@@ -224,14 +252,10 @@ async def callback(request):
     """
     return Response(html_content, media_type="text/html")
 
-# Get the pre-configured app from FastMCP, which includes the /sse endpoint
 app = mcp.sse_app()
-
-# Add our custom authentication routes to the app
 app.add_route("/login", login)
 app.add_route("/", lambda req: RedirectResponse(url='/login'), methods=['GET'])
 app.add_route("/callback", callback)
-
 
 if __name__ == "__main__":
     print("Starting server. Please open http://localhost:8888/login in your browser to authenticate with Spotify.")
