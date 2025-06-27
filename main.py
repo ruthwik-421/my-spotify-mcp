@@ -125,9 +125,9 @@ async def callback(request):
     initialize_spotipy(token_info['access_token'])
     return Response("Successfully authenticated! You can close this tab.", media_type="text/plain")
 
-# ** NEW: Get the pre-configured app from FastMCP **
+# ** CORRECTED LINE: Get the pre-configured app from FastMCP **
 # This app already includes the necessary /sse endpoint.
-app = mcp.starlette_app()
+app = mcp.sse_app()
 
 # ** NEW: Add our custom authentication routes to the app **
 app.add_route("/", homepage)
