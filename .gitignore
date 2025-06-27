@@ -1,0 +1,11 @@
+# Python virtual environment
+venv/
+
+# Environment variables file
+.env
+
+# Spotipy token cache
+.spotipy_cache
+
+# Python cache
+__pycache__/

@@ -1,0 +1,5 @@
+fastmcp[cli,sse]
+spotipy
+uvicorn
+python-dotenv
+gunicorn 
