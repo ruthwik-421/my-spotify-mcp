@@ -2,4 +2,6 @@ fastmcp[cli,sse]
 spotipy
 uvicorn
 python-dotenv
-gunicorn 
+gunicorn
+SQLAlchemy
+psycopg2-binary
