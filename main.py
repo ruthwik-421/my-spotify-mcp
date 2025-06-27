@@ -219,9 +219,9 @@ async def callback(request):
     # --- NEW: Save session to database ---
     db = SessionLocal()
     try:
-        # ** FIX: Use .astext to explicitly cast the JSON value to text for comparison **
+        # ** FINAL FIX: Use .as_string() for the correct JSON query syntax **
         existing_session = db.query(SpotifySession).filter(
-            SpotifySession.token_info['refresh_token'].astext == token_info['refresh_token']
+            SpotifySession.token_info['refresh_token'].as_string() == token_info['refresh_token']
         ).first()
 
         if existing_session:
