@@ -4,27 +4,17 @@ from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
 from starlette.applications import Starlette
 from starlette.responses import RedirectResponse, Response
-from starlette.routing import Route, Mount
+from starlette.routing import Route
 from mcp.server.fastmcp import FastMCP
-from mcp.server.sse import SseServerTransport
 import uvicorn
 
-# --- 1. INITIAL SETUP & CONFIGURATION ---
+# --- 1. INITIAL SETUP & CONFIGURATION (No changes here) ---
 
-# Load environment variables from .env file for local development
 load_dotenv()
-
-# Get Spotify credentials from environment variables
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
-
-# Define the permissions our app will ask the user for.
-# You can find all available scopes in the Spotipy documentation.
 SCOPES = "user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-modify-public playlist-modify-private"
-
-# This object will handle the OAuth flow and store the user's token.
-# The cache file stores the token so you don't have to log in every time.
 sp_oauth = SpotifyOAuth(
     client_id=CLIENT_ID,
     client_secret=CLIENT_SECRET,
@@ -32,21 +22,16 @@ sp_oauth = SpotifyOAuth(
     scope=SCOPES,
     cache_path=".spotipy_cache"
 )
-
-# Global variable to hold the authenticated Spotipy client
 sp = None
 
-# --- 2. MCP SERVER AND TOOLS DEFINITION ---
+# --- 2. MCP SERVER AND TOOLS DEFINITION (No changes here) ---
 
-# Initialize our FastMCP server
 mcp = FastMCP(
     "Spotify Controller",
     description="An MCP server to control Spotify playback and playlists."
 )
 
-# Helper function to check if the user is authenticated
 def check_auth():
-    """Checks if the Spotipy client is authenticated. Raises an exception if not."""
     if not sp:
         raise Exception("Not authenticated with Spotify. Please visit /login in your browser to authenticate.")
 
@@ -58,7 +43,6 @@ def search_and_play(query: str) -> str:
         results = sp.search(q=query, type='track', limit=1)
         if not results['tracks']['items']:
             return f"No results found for '{query}'."
-        
         track = results['tracks']['items'][0]
         track_uri = track['uri']
         sp.start_playback(uris=[track_uri])
@@ -110,16 +94,12 @@ def get_current_song() -> str:
     except Exception as e:
         return f"An error occurred: {e}"
 
-# --- 3. WEB SERVER (STARLETTE) FOR AUTHENTICATION & SERVING MCP ---
+# --- 3. WEB SERVER & AUTHENTICATION (Updated Code) ---
 
-# This function initializes the authenticated Spotipy client
 def initialize_spotipy(access_token):
     """Initializes the global spotipy client with the given token."""
     global sp
     sp = spotipy.Spotify(auth=access_token)
-
-# This is the main web app that will handle HTTP requests
-# It has three routes: /, /login, and /callback
 
 async def homepage(request):
     """Homepage that checks for a token and tries to initialize Spotipy."""
@@ -131,7 +111,6 @@ async def homepage(request):
             return Response("Authenticated with Spotify! You can now use the MCP tools.", media_type="text/plain")
     except Exception:
         pass # Ignore if no token
-        
     return RedirectResponse(url='/login')
 
 async def login(request):
@@ -143,36 +122,17 @@ async def callback(request):
     """Handles the redirect from Spotify after the user grants permission."""
     code = request.query_params['code']
     token_info = sp_oauth.get_access_token(code)
-    # The token is now cached in .spotipy_cache
     initialize_spotipy(token_info['access_token'])
     return Response("Successfully authenticated! You can close this tab.", media_type="text/plain")
 
-# --- 4. COMBINING MCP AND WEB SERVER ---
+# ** NEW: Get the pre-configured app from FastMCP **
+# This app already includes the necessary /sse endpoint.
+app = mcp.starlette_app()
 
-# Setup the SSE transport for the MCP server. This is what AI clients will connect to.
-sse = SseServerTransport("/messages/")
-
-async def handle_sse(request):
-    """This function handles the connection from an MCP client."""
-    async with sse.connect_sse(request.scope, request.receive, request._send) as (
-        read_stream,
-        write_stream,
-    ):
-        # ** FIX: The call to mcp.run() is simplified here **
-        await mcp.run(read_stream, write_stream)
-
-# Define all the routes for our application
-routes = [
-    Route("/", endpoint=homepage),
-    Route("/login", endpoint=login),
-    Route("/callback", endpoint=callback),
-    Route("/sse", endpoint=handle_sse),
-    Mount("/messages/", app=sse.handle_post_message),
-]
-
-# Create the main Starlette application
-app = Starlette(debug=True, routes=routes)
-
+# ** NEW: Add our custom authentication routes to the app **
+app.add_route("/", homepage)
+app.add_route("/login", login)
+app.add_route("/callback", callback)
 
 # This part allows us to run the server locally for testing
 if __name__ == "__main__":
