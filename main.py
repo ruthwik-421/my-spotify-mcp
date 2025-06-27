@@ -1,5 +1,7 @@
 import os
 import uuid
+import random # Import the random module
+import re # Import the regular expression module
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
@@ -9,17 +11,12 @@ from starlette.routing import Route
 from mcp.server.fastmcp import FastMCP
 import uvicorn
 
-# --- 1. CONFIGURATION ---
+# --- 1. CONFIGURATION (No changes here) ---
 
-# Load environment variables from .env file for local development
 load_dotenv()
-
-# Spotify App Credentials
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
-
-# New expanded scopes to access more user data
 SCOPES = (
     "user-read-playback-state "
     "user-modify-playback-state "
@@ -30,17 +27,12 @@ SCOPES = (
     "playlist-modify-private "
     "user-read-recently-played"
 )
-
-# In-memory storage for active user sessions.
-# In a real production app, you would use a database like Redis for this.
-# Format: { "session_id": token_info_dict, ... }
 ACTIVE_SESSIONS = {}
 
 
-# --- 2. AUTHENTICATION & SESSION HELPERS ---
+# --- 2. AUTHENTICATION & SESSION HELPERS (No changes here) ---
 
 def create_spotify_oauth():
-    """Creates a SpotifyOAuth instance for the authentication flow."""
     return SpotifyOAuth(
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
@@ -49,25 +41,17 @@ def create_spotify_oauth():
     )
 
 def get_sp_for_session(session_id: str):
-    """
-    Given a session_id, retrieve the token info, create an authenticated
-    Spotipy client, and return it. This is the core of our multi-user system.
-    """
     token_info = ACTIVE_SESSIONS.get(session_id)
     if not token_info:
         raise Exception("Invalid or expired session_id. Please log in again via the web interface to get a new one.")
-
-    # Check if the token is expired and refresh if necessary
-    # This keeps the user's session alive for a long time.
     if SpotifyOAuth.is_token_expired(token_info):
         sp_oauth = create_spotify_oauth()
         token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
-        ACTIVE_SESSIONS[session_id] = token_info  # Save the refreshed token
-
+        ACTIVE_SESSIONS[session_id] = token_info
     return spotipy.Spotify(auth=token_info["access_token"])
 
 
-# --- 3. MCP SERVER AND TOOLS DEFINITION ---
+# --- 3. MCP SERVER AND TOOLS DEFINITION (No changes here) ---
 
 mcp = FastMCP(
     "Public Spotify Controller",
@@ -82,7 +66,6 @@ def search_and_play(session_id: str, query: str) -> str:
         results = sp.search(q=query, type='track', limit=1)
         if not results['tracks']['items']:
             return f"No results found for '{query}'."
-        
         track = results['tracks']['items'][0]
         track_uri = track['uri']
         sp.start_playback(uris=[track_uri])
@@ -134,8 +117,6 @@ def get_current_song(session_id: str) -> str:
     except Exception as e:
         return f"An error occurred: {e}"
 
-# --- NEW TOOLS ---
-
 @mcp.tool()
 def get_my_playlists(session_id: str) -> str:
     """Retrieves all playlists for the user of the given session."""
@@ -144,7 +125,6 @@ def get_my_playlists(session_id: str) -> str:
         playlists = sp.current_user_playlists()
         if not playlists['items']:
             return "You don't have any playlists."
-        
         playlist_names = [p['name'] for p in playlists['items']]
         return "Here are your playlists:\n" + "\n".join(f"- {name}" for name in playlist_names)
     except Exception as e:
@@ -158,7 +138,6 @@ def get_recently_played(session_id: str) -> str:
         results = sp.current_user_recently_played(limit=5)
         if not results['items']:
             return "You haven't played any tracks recently."
-
         tracks = [f"{item['track']['name']} by {item['track']['artists'][0]['name']}" for item in results['items']]
         return "Here are your recently played tracks:\n" + "\n".join(f"- {track}" for track in tracks)
     except Exception as e:
@@ -169,26 +148,20 @@ def add_to_playlist(session_id: str, song_query: str, playlist_name: str) -> str
     """Searches for a song and adds it to one of the user's playlists."""
     sp = get_sp_for_session(session_id)
     try:
-        # 1. Find the song
         results = sp.search(q=song_query, type='track', limit=1)
         if not results['tracks']['items']:
             return f"Could not find the song: '{song_query}'."
         track = results['tracks']['items'][0]
         track_uri = track['uri']
         track_name = track['name']
-
-        # 2. Find the playlist
         playlists = sp.current_user_playlists()
         target_playlist = None
         for p in playlists['items']:
             if p['name'].lower() == playlist_name.lower():
                 target_playlist = p
                 break
-        
         if not target_playlist:
             return f"Could not find a playlist named '{playlist_name}'."
-
-        # 3. Add the song to the playlist
         sp.playlist_add_items(target_playlist['id'], [track_uri])
         return f"Successfully added '{track_name}' to your '{playlist_name}' playlist."
     except Exception as e:
@@ -205,19 +178,29 @@ async def login(request):
 async def callback(request):
     """
     Handles the redirect from Spotify after user grants permission.
-    Generates a session_id, stores the token, and displays the id to the user.
+    Generates a user-friendly session_id, stores the token, and displays the id.
     """
     sp_oauth = create_spotify_oauth()
     code = request.query_params['code']
     token_info = sp_oauth.get_access_token(code, as_dict=True)
+
+    # --- THIS IS THE UPDATED LOGIC ---
+    # 1. Create a temporary client to get the user's name
+    temp_sp = spotipy.Spotify(auth=token_info["access_token"])
+    user_profile = temp_sp.current_user()
     
-    # Generate a unique session ID for this user
-    session_id = str(uuid.uuid4())
-    
-    # Store the token info with the session ID
+    # 2. Sanitize display name (remove spaces/special chars) and get a random number
+    display_name = user_profile.get('display_name', 'user')
+    sanitized_name = re.sub(r'[^a-zA-Z0-9]', '-', display_name).lower()
+    random_id = random.randint(100, 999)
+
+    # 3. Create the new, user-friendly session ID
+    session_id = f"{sanitized_name}-{random_id}"
+
+    # 4. Store the token info with the new session ID
     ACTIVE_SESSIONS[session_id] = token_info
 
-    # Return a styled HTML page with the session ID for the user to copy
+    # 5. Return the styled HTML page with the new session ID for the user to copy
     html_content = f"""
     <html>
         <head>
@@ -227,7 +210,7 @@ async def callback(request):
                 .container {{ background-color: #282828; padding: 40px; border-radius: 10px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.5); max-width: 90%; }}
                 h1 {{ color: #1DB954; }}
                 p {{ font-size: 1.1em; line-height: 1.6;}}
-                code {{ background-color: #535353; padding: 10px; border-radius: 5px; font-family: monospace; user-select: all; word-break: break-all; display: inline-block; margin-top: 10px; }}
+                code {{ background-color: #535353; padding: 15px; border-radius: 5px; font-family: monospace; user-select: all; word-break: break-all; display: inline-block; margin-top: 10px; font-size: 1.2em; }}
             </style>
         </head>
         <body>
