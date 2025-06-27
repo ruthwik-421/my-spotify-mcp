@@ -158,11 +158,8 @@ async def handle_sse(request):
         read_stream,
         write_stream,
     ):
-        await mcp.run(
-            read_stream,
-            write_stream,
-            mcp.create_initialization_options(),
-        )
+        # ** FIX: The call to mcp.run() is simplified here **
+        await mcp.run(read_stream, write_stream)
 
 # Define all the routes for our application
 routes = [
@@ -179,5 +176,5 @@ app = Starlette(debug=True, routes=routes)
 
 # This part allows us to run the server locally for testing
 if __name__ == "__main__":
-    print("Starting server. Please open https://localhost:8888 in your browser to authenticate with Spotify.")
+    print("Starting server. Please open http://localhost:8888 in your browser to authenticate with Spotify.")
     uvicorn.run(app, host="0.0.0.0", port=8888)
